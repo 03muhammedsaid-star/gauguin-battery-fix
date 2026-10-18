@@ -1,0 +1,6 @@
+id=gauguin-battery-fix
+name=Gauguin Battery Gauge Fix (Native C)
+version=v4.0
+versionCode=40
+author=muhammed
+description=Fixes LineageOS battery freezing issue on Redmi Note 9 Pro / Mi 10T Lite (gauguin) using an open-source native C Qualcomm QG daemon.
