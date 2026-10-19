@@ -1,7 +1,7 @@
 /*
  * qg_daemon.c - Xiaomi Redmi Note 9 Pro / Mi 10T Lite (gauguin) Open-Source Battery Daemon
  * Fixes Qualcomm Fuel Gauge (QG) desynchronization and freezing percentage on Custom ROMs.
- * Root Cause Fix: Dynamic IR Compensation & Active Healthd Sync
+ * Root Cause Fix: Dynamic IR Compensation & Active Healthd Sync + Monotonic Discharge Filter
  */
 
 #include <stdio.h>
@@ -17,7 +17,7 @@
 #include <sys/types.h>
 
 #define LOG_FILE "/data/local/tmp/qg-daemon.log"
-#define QG_DEV   "/dev/qg"
+#define QG_DEV    "/dev/qg"
 #define FG_RESET "/sys/class/power_supply/bms/fg_reset"
 #define CAPACITY "/sys/class/power_supply/bms/capacity"
 #define VOLT_NOW "/sys/class/power_supply/bms/voltage_now"
@@ -81,6 +81,22 @@ static int write_str_file(const char *path, const char *str) {
     return 0;
 }
 
+static int check_is_charging(void) {
+    FILE *f = fopen("/sys/class/power_supply/battery/status", "r");
+    if (!f) f = fopen("/sys/class/power_supply/bms/status", "r");
+    if (!f) return 0;
+    char status[32] = {0};
+    if (fscanf(f, "%31s", status) == 1) {
+        fclose(f);
+        if (strcmp(status, "Charging") == 0 || strcmp(status, "Full") == 0) {
+            return 1;
+        }
+    } else {
+        fclose(f);
+    }
+    return 0;
+}
+
 static int soc_of(int index) {
     if (index <= 45) {
         return 100 - (2 * index);
@@ -125,7 +141,6 @@ static int apply_soc(int target_soc, uint32_t ocv) {
     ssize_t n = write(fd, udata, sizeof(udata));
     close(fd);
 
-    /* Trigger Android Framework Battery Properties update */
     system("cmd battery reset 2>/dev/null");
 
     return (n == sizeof(udata)) ? 0 : -1;
@@ -153,6 +168,11 @@ static int do_calibrate(void) {
 
     log_msg("Kalibrasyon: OCV=%u uV -> Gercek: %%%d, Ekranda: %%%ld", ocv, real_soc, cap);
 
+    int charging = check_is_charging();
+    if (!charging && real_soc > cap) {
+        real_soc = (int)cap;
+    }
+
     if (labs(real_soc - cap) < 2) return 0;
 
     if (apply_soc(real_soc, ocv) == 0) {
@@ -165,9 +185,8 @@ static int do_calibrate(void) {
 static void smart_check(void) {
     long v = 0, cur = 0;
     if (read_int_file(VOLT_NOW, &v) != 0) return;
-    read_int_file(CURR_NOW, &cur); // uA
+    read_int_file(CURR_NOW, &cur);
 
-    /* Compensate IR drop: V_ocv_est = V_now + (I * R_int) */
     long v_comp_uv = v + (cur / 1000) * R_INT_MOHM;
     if (v_comp_uv < 3000000) v_comp_uv = 3000000;
 
@@ -175,8 +194,13 @@ static void smart_check(void) {
     long cap = 0;
     if (read_int_file(CAPACITY, &cap) != 0) return;
 
+    int charging = check_is_charging();
+    if (!charging && est_soc > cap) {
+        est_soc = (int)cap;
+    }
+
     if (labs(est_soc - cap) >= 3) {
-        log_msg("Kök Neden Düzeltmesi (Yük/Akım Düzeltmeli): V_now=%ld mV, I=%ld mA -> Est_OCV=%ld mV, Tahmin=%%%d, Gorunen=%%%ld",
+        log_msg("Kok Neden Duzeltmesi (Yuk/Akim Duzeltmeli): V_now=%ld mV, I=%ld mA -> Est_OCV=%ld mV, Tahmin=%%%d, Gorunen=%%%ld",
                 v / 1000, cur / 1000, v_comp_uv / 1000, est_soc, cap);
         do_calibrate();
     }
@@ -190,17 +214,17 @@ int main(int argc, char **argv) {
         return do_calibrate();
     }
 
-    log_msg("qg-daemon v4.2 baslatildi (Dinamik Akım Kompanzasyonu & Active Sync).");
+    log_msg("qg-daemon v4.3 baslatildi (Dinamik Akim Kompanzasyonu & Active Sync & Monotonic Filter).");
     do_calibrate();
 
     int cycle = 0;
     while (g_running) {
-        sleep(60); // Akılcı 60 saniye periyodu
+        sleep(60);
         cycle++;
 
         smart_check();
 
-        if (cycle >= 60) { // 1 saatte bir tam senkronizasyon
+        if (cycle >= 60) {
             do_calibrate();
             cycle = 0;
         }
