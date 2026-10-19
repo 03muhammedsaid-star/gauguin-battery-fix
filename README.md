@@ -17,16 +17,14 @@ On Xiaomi Redmi Note 9 Pro (5G) / Mi 10T Lite (*gauguin*) running LineageOS or o
 * On LineageOS and custom ROMs, `batterysecret` fails to maintain communication with the kernel QG driver. Without fresh calibration packets, the hardware coulomb counter and SoC estimator freeze.
 * Official LineageOS bug reports (e.g., Issue #87, #290) were closed without a fix as "third-party battery / hardware issue".
 
-### 💡 The Solution
+### 💡 The Solution (v4.2 - Dynamic IR Compensation & Active Sync)
 **`gauguin-battery-fix`** is an open-source, standalone native C daemon (`qg-daemon`) packaged as a Magisk module that replaces the broken telemetry path:
 1. Directly interacts with Qualcomm's `/dev/qg` hardware character device using native Linux syscalls (`open`, `read`, `write`).
 2. Reads hardware OCV measurements (`kdata`).
 3. Translates voltage to accurate percentage using the factory battery lookup table (56-point J17 Cosmx 4820mAh profile).
-4. Submits calibrated 144-byte `udata` packets back to `/dev/qg`.
-5. Runs in the background with zero CPU overhead:
-   - Periodic light checks every 60 seconds (comparing resting voltage with displayed percentage).
-   - Instant recalibration if divergence exceeds 3%.
-   - Full periodic sync every 2 hours as a fail-safe.
+4. **Dynamic IR Compensation:** Calculates internal resistance voltage sag ($V_{OCV} = V_{NOW} + I \cdot R_{INT}$) under CPU load, preventing check suppression during heavy usage.
+5. Submits calibrated 144-byte `udata` packets back to `/dev/qg` and triggers active Android framework sync (`cmd battery reset`).
+6. Runs in the background with zero CPU overhead (60-second periodic checks with 1-hour fail-safe full syncs).
 
 ---
 
@@ -49,7 +47,7 @@ adb reboot
 ### 🛠️ Building from Source
 Requires an ARM64 cross-compiler (`aarch64-linux-gnu-gcc`):
 ```bash
-git clone https://github.com/<your-username>/gauguin-battery-fix.git
+git clone https://github.com/03muhammedsaid-star/gauguin-battery-fix.git
 cd gauguin-battery-fix
 make
 ```
@@ -69,12 +67,13 @@ Xiaomi Redmi Note 9 Pro / Mi 10T Lite (*gauguin*) cihazlarda LineageOS veya diğ
 * LineageOS'ta bu kapalı kaynak servis düzgün çalışmadığı için çip güncel veri alamaz ve donar.
 * LineageOS resmi kayıtlarında (Issue #87, #290) bu durum "üçüncü parti pil / donanım arızası" denilerek kapatılmıştır.
 
-### 💡 Çözüm
+### 💡 Çözüm (v4.2 - Dinamik Akım Kompanzasyonu & Active Sync)
 Bu proje, Xiaomi'nin eksik kalan sürücüsünün işini devralan **saf C ile derlenmiş bağımsız bir sistem servisi (`qg-daemon`)** ve **Magisk modülüdür**:
 * `/dev/qg` donanım arabiriminden OCV gerilimini okur.
 * Orijinal fabrika batarya tablosundan (56 noktalı Cosmx 4820mAh eğrisi) gerçek yüzdeyi hesaplar.
-* Çipe 144 baytlık kalibrasyon paketini ileterek donanımı anında senkronize eder.
-* Arka planda dakikada bir kontrol yapar, %3'ten fazla sapma olursa anında düzeltir.
+* **Dinamik Akım Kompanzasyonu:** İşlemci yük altındayken çekilen akıma göre oluşan voltaj düşüşünü ($V_{OCV} = V_{NOW} + I \cdot R_{INT}$) matematiksel olarak hesaba katar, yük altında kontrolün atlanmasını engeller.
+* Çipe 144 baytlık kalibrasyon paketini iletir ve Android `healthd` önbelleğini yeniler (`cmd battery reset`).
+* Arka planda 60 saniyede bir kontrol yapar, %3'ten fazla sapma olursa anında düzeltir.
 
 ---
 
