@@ -1,8 +1,7 @@
 /*
  * qg_daemon.c - Xiaomi Redmi Note 9 Pro / Mi 10T Lite (gauguin) Open-Source Battery Daemon
  * Fixes Qualcomm Fuel Gauge (QG) desynchronization and freezing percentage on Custom ROMs.
- *
- * Released under the MIT License.
+ * Root Cause Fix: Dynamic IR Compensation & Active Healthd Sync
  */
 
 #include <stdio.h>
@@ -24,7 +23,9 @@
 #define VOLT_NOW "/sys/class/power_supply/bms/voltage_now"
 #define CURR_NOW "/sys/class/power_supply/bms/current_now"
 
-/* 25C OCV-to-SoC Curve, unit: 0.1mV (100% down to 0%, 56-point profile for J17 Cosmx 4820mAh) */
+/* Internal Resistance approximation: ~100 mOhm */
+#define R_INT_MOHM 100
+
 static const uint32_t LUT[56] = {
     44364, 44133, 43920, 43709, 43490, 43266, 43033, 42791, 42544, 42298,
     42051, 41811, 41575, 41344, 41121, 40905, 40696, 40493, 40300, 40126,
@@ -108,131 +109,77 @@ static int soc_from_mv(uint32_t mv) {
     return 0;
 }
 
-static int do_calibrate(void) {
-    /* 1. Trigger FG Reset */
-    write_str_file(FG_RESET, "1\n");
-    sleep(3);
+static int apply_soc(int target_soc, uint32_t ocv) {
+    uint32_t udata[36];
+    memset(udata, 0, sizeof(udata));
+    udata[0] = (uint32_t)target_soc;
+    udata[1] = 1;
+    udata[2] = ocv;
+    udata[3] = 1;
 
-    /* 2. Read kdata buffer (412 bytes) from /dev/qg */
+    write_str_file(FG_RESET, "1\n");
+    usleep(300000);
+
+    int fd = open(QG_DEV, O_WRONLY);
+    if (fd < 0) return -1;
+    ssize_t n = write(fd, udata, sizeof(udata));
+    close(fd);
+
+    /* Trigger Android Framework Battery Properties update */
+    system("cmd battery reset 2>/dev/null");
+
+    return (n == sizeof(udata)) ? 0 : -1;
+}
+
+static int do_calibrate(void) {
+    write_str_file(FG_RESET, "1\n");
+    usleep(500000);
+
     int fd = open(QG_DEV, O_RDONLY);
-    if (fd < 0) {
-        log_msg("ERROR: Cannot open %s", QG_DEV);
-        return -1;
-    }
+    if (fd < 0) return -1;
 
     uint8_t kdata[412];
     ssize_t n = read(fd, kdata, sizeof(kdata));
     close(fd);
 
-    if (n != sizeof(kdata)) {
-        log_msg("ERROR: Incomplete kdata read (%zd bytes)", n);
-        return -1;
-    }
+    if (n != sizeof(kdata)) return -1;
 
-    /* Extract 32-bit OCV (microvolts) from offset 300 */
     uint32_t ocv = *(uint32_t *)(kdata + 300);
-    if (ocv < 3000000 || ocv > 5000000) {
-        log_msg("ERROR: Invalid OCV reading: %u uV", ocv);
-        return -1;
-    }
+    if (ocv < 3000000 || ocv > 5000000) return -1;
 
-    int soc = soc_from_mv(ocv / 100);
-
+    int real_soc = soc_from_mv(ocv / 100);
     long cap = 0;
     read_int_file(CAPACITY, &cap);
 
-    log_msg("OCV=%u uV -> Calculated: %%%d, Displayed: %%%ld", ocv, soc, cap);
+    log_msg("Kalibrasyon: OCV=%u uV -> Gercek: %%%d, Ekranda: %%%ld", ocv, real_soc, cap);
 
-    long diff = labs(soc - cap);
-    if (diff < 3) {
-        log_msg("Divergence <%ld, chip state is already aligned", diff);
+    if (labs(real_soc - cap) < 2) return 0;
+
+    if (apply_soc(real_soc, ocv) == 0) {
+        log_msg("Kalibrasyon basarili! Yeni gosterge: %%%d", real_soc);
         return 0;
     }
-
-    /* 3. Prepare 144-byte udata calibration payload */
-    uint32_t udata[36];
-    memset(udata, 0, sizeof(udata));
-    udata[0] = (uint32_t)soc;
-    udata[1] = 1;   /* soc valid */
-    udata[2] = ocv;
-    udata[3] = 1;   /* ocv valid */
-
-    write_str_file(FG_RESET, "1\n");
-    sleep(2);
-
-    /* 4. Write udata back to /dev/qg */
-    fd = open(QG_DEV, O_WRONLY);
-    if (fd < 0) {
-        log_msg("ERROR: Cannot open %s for writing", QG_DEV);
-        return -1;
-    }
-
-    n = write(fd, udata, sizeof(udata));
-    close(fd);
-
-    if (n != sizeof(udata)) {
-        log_msg("ERROR: Failed to write udata payload (%zd bytes)", n);
-        return -1;
-    }
-
-    sleep(3);
-    long new_cap = 0;
-    read_int_file(CAPACITY, &new_cap);
-    log_msg("Calibration successful! Capacity updated to: %%%ld", new_cap);
-
-    return 0;
+    return -1;
 }
 
-static void light_check(void) {
-    long cur = 0;
-    if (read_int_file(CURR_NOW, &cur) != 0) return;
-
-    /* Skip if phone is actively drawing heavy current (>100mA) */
-    if (labs(cur) > 100000) return;
-
-    long v = 0;
+static void smart_check(void) {
+    long v = 0, cur = 0;
     if (read_int_file(VOLT_NOW, &v) != 0) return;
+    read_int_file(CURR_NOW, &cur); // uA
 
-    int est_soc = soc_from_mv((uint32_t)(v / 100));
+    /* Compensate IR drop: V_ocv_est = V_now + (I * R_int) */
+    long v_comp_uv = v + (cur / 1000) * R_INT_MOHM;
+    if (v_comp_uv < 3000000) v_comp_uv = 3000000;
 
+    int est_soc = soc_from_mv((uint32_t)(v_comp_uv / 100));
     long cap = 0;
     if (read_int_file(CAPACITY, &cap) != 0) return;
 
     if (labs(est_soc - cap) >= 3) {
-        log_msg("Divergence detected: V=%ld mV, Est=%%%d, Disp=%%%ld -> Calibrating",
-                v / 1000, est_soc, cap);
+        log_msg("Kök Neden Düzeltmesi (Yük/Akım Düzeltmeli): V_now=%ld mV, I=%ld mA -> Est_OCV=%ld mV, Tahmin=%%%d, Gorunen=%%%ld",
+                v / 1000, cur / 1000, v_comp_uv / 1000, est_soc, cap);
         do_calibrate();
     }
-}
-
-static void check_log_rotate(void) {
-    struct stat st;
-    if (stat(LOG_FILE, &st) == 0) {
-        if (st.st_size > 200 * 1024) { /* 200 KB threshold */
-            unlink(LOG_FILE);
-            log_msg("Log rotated.");
-        }
-    }
-}
-
-static void wait_for_boot(void) {
-    int tries = 0;
-    while (tries < 120 && g_running) {
-        char buf[16] = {0};
-        FILE *f = popen("getprop sys.boot_completed", "r");
-        if (f) {
-            if (fgets(buf, sizeof(buf), f)) {
-                if (buf[0] == '1') {
-                    pclose(f);
-                    break;
-                }
-            }
-            pclose(f);
-        }
-        sleep(5);
-        tries++;
-    }
-    sleep(15);
 }
 
 int main(int argc, char **argv) {
@@ -240,34 +187,25 @@ int main(int argc, char **argv) {
     signal(SIGINT, sig_handler);
 
     if (argc > 1 && strcmp(argv[1], "test") == 0) {
-        log_msg("One-shot manual test executed.");
         return do_calibrate();
     }
 
-    log_msg("qg-daemon v4.0 started (Native C).");
-
-    wait_for_boot();
+    log_msg("qg-daemon v4.2 baslatildi (Dinamik Akım Kompanzasyonu & Active Sync).");
     do_calibrate();
 
     int cycle = 0;
     while (g_running) {
-        sleep(60);
+        sleep(60); // Akılcı 60 saniye periyodu
         cycle++;
 
-        /* Periodic 2-hour guarantee sync */
-        if (cycle >= 120) {
-            log_msg("Periodic 2-hour synchronization started.");
+        smart_check();
+
+        if (cycle >= 60) { // 1 saatte bir tam senkronizasyon
             do_calibrate();
             cycle = 0;
-        } else {
-            light_check();
-        }
-
-        if (cycle % 60 == 0) {
-            check_log_rotate();
         }
     }
 
-    log_msg("qg-daemon terminated.");
+    log_msg("qg-daemon durduruldu.");
     return 0;
 }
