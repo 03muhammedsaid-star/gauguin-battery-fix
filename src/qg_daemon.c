@@ -1,7 +1,7 @@
 /*
- * qg_daemon.c - Xiaomi Redmi Note 9 Pro / Mi 10T Lite (gauguin) Open-Source Battery Daemon
- * Fixes Qualcomm Fuel Gauge (QG) desynchronization and freezing percentage on Custom ROMs.
- * Root Cause Fix: Dynamic IR Compensation, Active Healthd Sync & Smooth Step Decay
+ * qg_daemon.c - Xiaomi Redmi Note 9 Pro / Mi 10T Lite (gauguin) Battery Daemon
+ * Fixes Qualcomm Fuel Gauge (QG) desynchronization on Custom ROMs.
+ * v4.5 - Bidirectional Smooth Adjustment & Threshold Calibration
  */
 
 #include <stdio.h>
@@ -77,21 +77,6 @@ static int write_str_file(const char *path, const char *str) {
     if (!f) return -1;
     fputs(str, f);
     fclose(f);
-    return 0;
-}
-
-static int check_is_charging(void) {
-    FILE *f = fopen("/sys/class/power_supply/battery/status", "r");
-    if (!f) return 0;
-    char status[32] = {0};
-    if (fscanf(f, "%31s", status) == 1) {
-        fclose(f);
-        if (strcmp(status, "Charging") == 0 || strcmp(status, "Full") == 0) {
-            return 1;
-        }
-    } else {
-        fclose(f);
-    }
     return 0;
 }
 
@@ -175,23 +160,21 @@ static void smart_check(void) {
     read_int_file(CURR_NOW, &cur_ua);
     if (read_int_file(CAPACITY, &cap) != 0) return;
 
-    long v_mv = v_uv / 1000;
     long cur_ma = cur_ua / 1000;
 
     long v_comp_uv = v_uv + (cur_ma * R_INT_MOHM);
     if (v_comp_uv < 3000000) v_comp_uv = 3000000;
 
     int est_soc = soc_from_mv((uint32_t)(v_comp_uv / 100));
-    int charging = check_is_charging();
 
-    if (!charging) {
-        if (est_soc < cap) {
-            do_calibrate((int)cap - 1);
-        }
-    } else {
-        if (est_soc > cap + 1) {
-            do_calibrate((int)cap + 1);
-        }
+    int diff = est_soc - (int)cap;
+
+    if (diff > 5 || diff < -5) {
+        do_calibrate(est_soc);
+    } else if (diff < 0) {
+        do_calibrate((int)cap - 1);
+    } else if (diff > 0) {
+        do_calibrate((int)cap + 1);
     }
 }
 
@@ -203,7 +186,7 @@ int main(int argc, char **argv) {
         return do_calibrate(-1);
     }
 
-    log_msg("qg-daemon v4.4 baslatildi (Smooth Step Decay Enabled).");
+    log_msg("qg-daemon v4.5 baslatildi (Bidirectional Sync Enabled).");
     do_calibrate(-1);
 
     while (g_running) {

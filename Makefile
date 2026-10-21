@@ -3,7 +3,7 @@ CFLAGS = -static -O3 -s -Wall -Wextra
 SRC = src/qg_daemon.c
 BUILD_DIR = build
 TARGET_BIN = $(BUILD_DIR)/qg-daemon
-ZIP_NAME = $(BUILD_DIR)/gauguin-battery-fix-v4.0.zip
+ZIP_NAME = $(BUILD_DIR)/gauguin-battery-fix-v4.5.zip
 
 .PHONY: all clean module
 
